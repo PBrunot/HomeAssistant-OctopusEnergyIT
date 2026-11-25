@@ -3,8 +3,9 @@
 Meter readings reach the API days after the energy was used, so an entity
 state changes on the day of the poll, not of the consumption. To give the
 Energy dashboard the right days, the cumulative readings are imported as
-external statistics: the consumption between two readings is booked at the
-start of the period it belongs to (local midnight of the earlier reading).
+external statistics. Daily consumption is booked at local midnight of the
+day it belongs to. Longer intervals are estimated across their local days,
+in proportion to elapsed time; they are not actual daily measurements.
 
 Imports are incremental and idempotent: only periods after the last stored
 statistic are written, continuing from its ``sum``. Home Assistant updates,
@@ -15,9 +16,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import itertools
 import logging
+import math
 import re
 from typing import Any
 
@@ -72,26 +74,42 @@ def period_rows(
     """Turn cumulative readings into statistic rows after *cursor*.
 
     *points* are ``(read_at, register_value)`` pairs. Each consecutive pair
-    yields one row booked at the local start of day of the earlier reading,
-    with ``sum`` continuing from the cursor. A register that goes backwards
-    (meter replaced or reset) contributes zero. *multiplier* converts the
-    consumption, e.g. into a cost.
+    contributes its delta to the local days it overlaps, with ``sum``
+    continuing from the cursor. Longer intervals have an estimated daily
+    allocation, weighted by elapsed time (including 23/25-hour DST days).
+    A register that goes backwards contributes zero. A zero baseline before
+    the first day lets the Energy dashboard count that day's consumption.
     """
-    ordered = sorted(points, key=lambda point: point[0])
+    # The provider can return revised readings at an identical timestamp.
+    # Keep the last one; subtracting both can count the same interval twice.
+    ordered = sorted(dict(points).items())
+    daily: dict[datetime, float] = {}
+    for (prev_at, prev_value), (read_at, value) in itertools.pairwise(ordered):
+        duration = (read_at - prev_at).total_seconds()
+        consumption = max(0.0, value - prev_value) * multiplier
+        part_start = prev_at
+        while part_start < read_at:
+            day = dt_util.as_local(part_start).date()
+            start = dt_util.as_utc(dt_util.start_of_local_day(day))
+            next_day = dt_util.as_utc(
+                dt_util.start_of_local_day(day + timedelta(days=1))
+            )
+            part_end = min(read_at, next_day)
+            daily[start] = daily.get(start, 0.0) + (
+                consumption * (part_end - part_start).total_seconds() / duration
+            )
+            part_start = part_end
+
     rows: list[dict[str, Any]] = []
     running = cursor.sum
-    for (prev_at, prev_value), (_at, value) in itertools.pairwise(ordered):
-        start = dt_util.as_utc(dt_util.start_of_local_day(dt_util.as_local(prev_at)))
+    if daily and cursor.start is None:
+        rows.append({"start": min(daily) - timedelta(hours=1), "sum": running})
+    for start, consumption in sorted(daily.items()):
         if cursor.start is not None and start <= cursor.start:
             continue
-        running += max(0.0, value - prev_value) * multiplier
-        # The state is the meter register for consumption, the total for cost.
-        state = value if multiplier == 1.0 else round(running, 4)
-        row = {"start": start, "sum": round(running, 4), "state": state}
-        if rows and rows[-1]["start"] == start:
-            rows[-1] = row  # several readings on one day: one daily row
-        else:
-            rows.append(row)
+        running += consumption
+        # Only sum is needed: a daily allocation is not a register snapshot.
+        rows.append({"start": start, "sum": round(running, 6)})
     last_start = rows[-1]["start"] if rows else cursor.start
     return rows, Cursor(last_start, running)
 
@@ -105,14 +123,20 @@ def readings_to_points(
         raw_date, value = reading.get(date_key), reading.get("value")
         if not isinstance(raw_date, str) or value is None:
             continue
-        if "T" in raw_date:
-            read_at = dt_util.parse_datetime(raw_date)
-        else:  # date only (gas readings): local midnight of that day
-            parsed_date = dt_util.parse_date(raw_date)
-            read_at = dt_util.start_of_local_day(parsed_date) if parsed_date else None
-        if read_at is None:
+        try:
+            numeric_value = float(value)
+            if "T" in raw_date:
+                read_at = dt_util.parse_datetime(raw_date)
+            else:  # date only (gas readings): local midnight of that day
+                parsed_date = dt_util.parse_date(raw_date)
+                read_at = (
+                    dt_util.start_of_local_day(parsed_date) if parsed_date else None
+                )
+        except (TypeError, ValueError, OverflowError):
             continue
-        points.append((dt_util.as_utc(read_at), float(value)))
+        if read_at is None or not math.isfinite(numeric_value) or numeric_value < 0:
+            continue
+        points.append((dt_util.as_utc(read_at), numeric_value))
     return points
 
 

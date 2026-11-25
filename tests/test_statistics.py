@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import itertools
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -46,11 +47,11 @@ class TestPeriodRows:
         rows, cursor = period_rows(_points(100.0, 110.0, 125.0), Cursor())
 
         assert [row["start"] for row in rows] == [
+            _local_midnight(2026, 11, 1) - timedelta(hours=1),
             _local_midnight(2026, 11, 1),
             _local_midnight(2026, 11, 2),
         ]
-        assert [row["sum"] for row in rows] == [10.0, 25.0]
-        assert [row["state"] for row in rows] == [110.0, 125.0]
+        assert [row["sum"] for row in rows] == [0.0, 10.0, 25.0]
         assert cursor == Cursor(_local_midnight(2026, 11, 2), 25.0)
 
     def test_continues_after_cursor_without_rewriting_old_days(self):
@@ -71,19 +72,18 @@ class TestPeriodRows:
     def test_register_going_backwards_counts_as_zero(self):
         rows, _ = period_rows(_points(100.0, 5.0, 8.0), Cursor())
 
-        assert [row["sum"] for row in rows] == [0.0, 3.0]
+        assert [row["sum"] for row in rows] == [0.0, 0.0, 3.0]
 
     def test_unsorted_input_is_sorted(self):
         points = _points(100.0, 110.0, 125.0)
         rows, _ = period_rows(list(reversed(points)), Cursor())
 
-        assert [row["sum"] for row in rows] == [10.0, 25.0]
+        assert [row["sum"] for row in rows] == [0.0, 10.0, 25.0]
 
     def test_multiplier_converts_to_cost_and_state_is_the_total(self):
         rows, _ = period_rows(_points(100.0, 110.0), Cursor(), multiplier=0.25)
 
-        assert rows[0]["sum"] == 2.5
-        assert rows[0]["state"] == 2.5
+        assert rows[-1]["sum"] == 2.5
 
     def test_two_readings_on_one_day_make_one_row(self):
         points = [
@@ -93,18 +93,65 @@ class TestPeriodRows:
         ]
         rows, _ = period_rows(points, Cursor())
 
-        assert len(rows) == 1
-        assert rows[0]["sum"] == 10.0
+        assert len(rows) == 2  # baseline followed by the daily total
+        assert rows[-1]["sum"] == 10.0
 
     def test_dst_change_keeps_local_midnight(self):
         # 25 Oct 2026: Italy leaves summer time; the day is 25 hours long.
         rows, _ = period_rows(_points(100.0, 110.0, start_day=25, month=10), Cursor())
 
-        assert rows[0]["start"] == _local_midnight(2026, 10, 25)
-        assert rows[0]["start"].astimezone(ROME).hour == 0
+        assert rows[-1]["start"] == _local_midnight(2026, 10, 25)
+        assert rows[-1]["start"].astimezone(ROME).hour == 0
+
+    def test_reported_example_counts_first_day_with_a_baseline(self):
+        rows, _ = period_rows(_points(13329.56, 13345.26, start_day=23), Cursor())
+        assert rows[0]["start"] == _local_midnight(2026, 11, 23) - timedelta(hours=1)
+        assert rows[0]["sum"] == 0
+        assert rows[1]["start"] == _local_midnight(2026, 11, 23)
+        assert rows[1]["sum"] - rows[0]["sum"] == pytest.approx(15.70)
+
+    def test_duplicate_timestamp_keeps_last_revision(self):
+        points = _points(100.0, 110.0, 125.0)
+        points.insert(1, (points[0][0], 90.0))
+        rows, _ = period_rows(points, Cursor())
+        assert [row["sum"] for row in rows] == [0.0, 20.0, 35.0]
+
+    def test_multi_day_interval_does_not_book_everything_on_first_day(self):
+        points = [
+            (_local_midnight(2026, 11, 1), 100),
+            (_local_midnight(2026, 11, 4), 130),
+        ]
+        rows, _ = period_rows(points, Cursor())
+        assert [row["sum"] for row in rows] == [0, 10, 20, 30]
+        assert [row["start"] for row in rows[1:]] == [
+            _local_midnight(2026, 11, day) for day in (1, 2, 3)
+        ]
+
+    @pytest.mark.parametrize(
+        ("month", "first_day", "hours"), [(3, 28, [24, 23, 24]), (10, 24, [24, 25, 24])]
+    )
+    def test_multi_day_estimate_respects_dst(self, month, first_day, hours):
+        points = [
+            (_local_midnight(2026, month, first_day), 100),
+            (_local_midnight(2026, month, first_day + 3), 100 + sum(hours)),
+        ]
+        rows, _ = period_rows(points, Cursor())
+        assert [b["sum"] - a["sum"] for a, b in itertools.pairwise(rows)] == hours
+
+    def test_insufficient_readings_does_not_create_a_baseline(self):
+        assert period_rows(_points(100.0), Cursor()) == ([], Cursor())
 
 
 class TestReadingsToPoints:
+    @pytest.mark.parametrize("value", ["invalid", "nan", "inf", "-inf", -1, {}, []])
+    def test_invalid_numeric_values_are_skipped(self, value):
+        assert (
+            readings_to_points(
+                [{"readAt": "2026-11-01T00:00:00Z", "value": value}], date_key="readAt"
+            )
+            == []
+        )
+
     def test_datetime_and_date_only_readings(self):
         points = readings_to_points(
             [
@@ -185,10 +232,10 @@ class TestStatisticsImporter:
         assert energy_meta["unit_of_measurement"] == "kWh"
         assert energy_meta["unit_class"] == "energy"
         assert energy_meta["has_sum"] is True
-        assert energy_rows[0]["sum"] == 10.0
+        assert [row["sum"] for row in energy_rows] == [0.0, 10.0]
         assert cost_meta["unit_of_measurement"] == "EUR"
         assert cost_meta["unit_class"] is None
-        assert cost_rows[0]["sum"] == pytest.approx(2.0)
+        assert cost_rows[-1]["sum"] == pytest.approx(2.0)
 
     async def test_no_cost_for_time_of_use_tariff(self, recorder):
         account = {
@@ -214,8 +261,9 @@ class TestStatisticsImporter:
         ((meta, rows),) = recorder.added
         assert meta["unit_of_measurement"] == "m³"
         assert meta["unit_class"] == "volume"
-        assert rows[0]["start"] == _local_midnight(2026, 9, 1)
-        assert rows[0]["sum"] == 40.5
+        assert rows[1]["start"] == _local_midnight(2026, 9, 1)
+        assert rows[-1]["sum"] == 40.5
+        assert len(rows) == 31  # baseline plus 30 estimated daily totals
 
     async def test_resumes_from_recorder_and_caches_cursor(self, recorder):
         stat_id = "octopus_energy_it:a_1_electricity_consumption"

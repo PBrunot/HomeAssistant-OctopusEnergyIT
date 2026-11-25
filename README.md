@@ -1,4 +1,6 @@
-# Integrazione Octopus Energy Italy per Home Assistant
+# Integrazione Octopus Energy Italy per Home Assistant — fork
+
+Questo repository è un **fork** di [samuelebistoletti/HomeAssistant-OctopusEnergyIT](https://github.com/samuelebistoletti/HomeAssistant-OctopusEnergyIT), mantenuto in [PBrunot/HomeAssistant-OctopusEnergyIT](https://github.com/PBrunot/HomeAssistant-OctopusEnergyIT). Include correzioni alle statistiche storiche per la Dashboard Energia. Per installare questo fork tramite HACS, segui le istruzioni qui sotto.
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 ![installation_badge](https://img.shields.io/badge/dynamic/json?color=41BDF5&logo=home-assistant&label=utenti&suffix=%20installs&cacheSeconds=15600&url=https://analytics.home-assistant.io/custom_integrations.json&query=%24.octopus_energy_it.total)
@@ -51,9 +53,10 @@ logger:
 
 ### HACS (consigliata)
 
-1. In HACS cerca "Octopus Energy Italy" e installa l'integrazione.
-2. Riavvia Home Assistant quando richiesto.
-3. Configura l'integrazione da **Impostazioni → Dispositivi e servizi → Aggiungi integrazione**.
+1. In HACS aggiungi `https://github.com/PBrunot/HomeAssistant-OctopusEnergyIT` come **repository personalizzato**, categoria **Integrazione**.
+2. Apri il repository del fork, seleziona **Scarica/Riscarica** e scegli **main** nel selettore della versione.
+3. Riavvia Home Assistant quando richiesto.
+4. Configura l'integrazione da **Impostazioni → Dispositivi e servizi → Aggiungi integrazione**.
 
 ### Installazione manuale
 
@@ -109,7 +112,7 @@ logger:
 | `sensor.octopus_<account>_gas_last_reading_date` | data | — |
 | `sensor.octopus_<account>_gas_meter_status` | testo | `account_number`, `pdr`, `enrollment_status`, `enrollment_started_at`, `supply_started_at`, `is_smart_meter`, `cancellation_reason` |
 
-Nota: `electricity_last_reading` è la lettura cumulativa del contatore (adatta alla dashboard Energia di HA), mentre `electricity_last_daily_reading` rappresenta il consumo dell'ultimo intervallo giornaliero.
+Nota: `electricity_last_reading` è la lettura cumulativa del contatore, mentre `electricity_last_daily_reading` rappresenta il consumo dell'ultimo intervallo. Per la Dashboard Energia usa le **statistiche esterne** descritte sotto: collegando direttamente questi sensori o un helper Utility Meter, il consumo viene registrato nel giorno dell'aggiornamento e non nel periodo della lettura.
 
 **Saldi e contratti**
 
@@ -197,11 +200,17 @@ Le letture del contatore arrivano all'API con qualche giorno di ritardo, quindi 
 
 | Statistica | Unità | Note |
 |---|---|---|
-| `octopus_energy_it:<account>_electricity_consumption` | kWh | Consumo elettrico giornaliero dalle letture del contatore |
+| `octopus_energy_it:<account>_electricity_consumption` | kWh | Consumo elettrico attribuito ai giorni delle letture; ripartizione stimata se mancano letture giornaliere |
 | `octopus_energy_it:<account>_electricity_cost` | EUR | Consumo × prezzo attuale; solo per tariffe monorarie (con le letture giornaliere non si può ripartire il consumo per fascia F1/F2/F3) |
-| `octopus_energy_it:<account>_gas_consumption` | m³ | Consumo gas tra due letture, attribuito al giorno della lettura precedente |
+| `octopus_energy_it:<account>_gas_consumption` | m³ | Consumo gas tra due letture, ripartito sui giorni dell'intervallo come stima |
 
 Per usarle: **Impostazioni → Dashboard → Energia**, aggiungi la statistica *Octopus … electricity consumption* come consumo dalla rete (e, se vuoi, *… electricity cost* come costo), e *Octopus … gas consumption* per il gas. L'import è incrementale: al primo avvio vengono recuperati gli ultimi giorni disponibili, poi solo i periodi nuovi.
+
+Le statistiche esterne sono disponibili dalla **1.3.0b1**: la 1.2.5 non le crea. Per installare le correzioni di questo fork, aggiungi `https://github.com/PBrunot/HomeAssistant-OctopusEnergyIT` come repository personalizzato di tipo **Integrazione** in HACS. Apri **Riscarica**, seleziona **main** nel selettore della versione e riavvia Home Assistant dopo il download. Cerca `Octopus` nel selettore della Dashboard Energia; non sono normali entità `sensor.*`. L'ID segue il formato `octopus_energy_it:<account>_electricity_consumption`, con il numero di conto in minuscolo e i trattini sostituiti da underscore. Servono almeno due letture dello stesso registro. Se la statistica non compare, controlla i log per `Failed to import statistics`.
+
+Esempio: da 13.329,56 kWh il 23 novembre a 13.345,26 kWh il 24 novembre vengono importati **15,70 kWh per il 23 novembre**, anche se l'API viene interrogata il 25. Un punto iniziale a zero permette di contare anche il primo giorno. La collocazione a mezzanotte è una convenzione contabile e non indica un consumo orario misurato. Gli intervalli di più giorni sono ripartiti in proporzione alle ore effettive di ciascun giorno, inclusi i cambi di ora legale.
+
+Limiti: vengono importate le letture recenti restituite dall'API, non l'intero storico del contratto. I periodi già importati non vengono corretti automaticamente. Il costo è una **stima al prezzo attuale**, non una ricostruzione della bolletta o delle tariffe storiche. Sostituisci la vecchia sorgente nella Dashboard Energia senza aggiungere entrambe, per evitare doppi conteggi.
 
 ## Sviluppo locale
 
