@@ -11,8 +11,8 @@ from homeassistant.util.dt import as_utc, parse_datetime, utcnow
 _LOGGER = logging.getLogger(__name__)
 
 
-# How many recent POINT_IN_TIME readings to fetch: enough to find two readings
-# of the same register when the API returns several registers per day.
+# Recent sensor snapshots only; HistorySync independently fetches statistics
+# history. Enough to find two readings of one register when several exist.
 ELECTRICITY_READINGS_WINDOW = 10
 # Gas readings are sparse (often monthly); a few are enough to bridge gaps.
 GAS_READINGS_WINDOW = 5

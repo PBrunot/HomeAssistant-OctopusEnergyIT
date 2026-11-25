@@ -289,13 +289,14 @@ class StatisticsImporter:
 
     async def async_import_account(
         self, account_number: str, account: dict[str, Any]
-    ) -> None:
-        """Import electricity, electricity cost and gas statistics of an account."""
+    ) -> int:
+        """Import an account's statistics; return the added or corrected row count."""
+        written = 0
         electricity = readings_to_points(
             account.get("electricity_readings") or [], date_key="readAt"
         )
         if electricity:
-            await self.async_import(
+            written += await self.async_import(
                 account_number,
                 ELECTRICITY,
                 electricity,
@@ -304,7 +305,7 @@ class StatisticsImporter:
             )
             price = _flat_electricity_price(account)
             if price is not None:
-                await self.async_import(
+                written += await self.async_import(
                     account_number,
                     ELECTRICITY_COST,
                     electricity,
@@ -317,9 +318,10 @@ class StatisticsImporter:
             account.get("gas_readings") or [], date_key="readingDate"
         )
         if gas:
-            await self.async_import(
+            written += await self.async_import(
                 account_number, GAS, gas, unit="m³", unit_class="volume"
             )
+        return written
 
 
 def _flat_electricity_price(account: dict[str, Any]) -> float | None:

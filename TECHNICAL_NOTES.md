@@ -240,6 +240,11 @@ The integration polls at two speeds:
 | Planned dispatches | every 30 s, max 4 requests/min in total (`DISPATCH_REQUESTS_PER_MINUTE`) | `fetch_flex_planned_dispatches(min_interval=...)` |
 | Account, balances, tariffs, contracts | every 15 min (`ACCOUNT_REFRESH`), cached otherwise | `COMPREHENSIVE_QUERY` |
 | Electricity and gas readings | cached 30 min (`READINGS_REFRESH`) | `fetch_electricity_measurements`, `fetch_gas_meter_readings` |
+| Historical electricity/gas readings | one 50-node page per 30 s across accounts/supplies; refresh 30 days every 30 min after initial 12 months | `HistorySync`, `fetch_readings_page` |
 | Last charging session | cached 15 min | `fetch_last_charging_session` |
 
 If the full query fails, the last account data is reused; if planned dispatches are rate-limited, the last plan is kept.
+
+`HistorySync` starts after Home Assistant is running to avoid waiting for recorder startup inside the integration's first refresh. It checkpoints each successful page to `.storage/octopus_energy_it.<entry_id>.history`, using HA's `Store`; this contains local meter readings and cursors, never credentials or authentication tokens. It imports only completed ranges and waits for recorder commits before marking a range complete. Restart recovery resumes saved cursors, and refreshes after an outage extend to the previous successful end date. `history_sync` in account diagnostics exposes dates and counts without supply IDs or cursor values.
+
+The recent sensor fetches remain small and cached; they are not a second statistics writer. Historical source readings are retained to anchor sparse gas readings and recompute cumulative sums. Initial progress updates one persistent HA notification per supply; routine unchanged refreshes stay quiet. Notification messages are translated through the integration's backend message resources; notification failures do not stop imports.

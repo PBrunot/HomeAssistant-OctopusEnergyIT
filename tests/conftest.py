@@ -129,6 +129,17 @@ def _install_config_flow_stub(ce) -> None:
 def _install_stubs() -> None:
     """Install all required stubs (safe to call multiple times)."""
 
+    storage = _stub("homeassistant.helpers.storage")
+    storage.Store = MagicMock(
+        side_effect=lambda *args, **kwargs: types.SimpleNamespace(
+            async_load=AsyncMock(return_value=None), async_save=AsyncMock()
+        )
+    )
+    notifications = _stub("homeassistant.components.persistent_notification")
+    notifications.async_create = MagicMock()
+    translation = _stub("homeassistant.helpers.translation")
+    translation.async_get_translations = AsyncMock(return_value={})
+
     # ---- custom_components package (must be a proper package with __path__) ----
     # This ensures test_api_client.py's setdefault() doesn't override it with a
     # plain module, which would prevent submodule imports in other test files.

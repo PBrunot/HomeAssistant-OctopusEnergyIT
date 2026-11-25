@@ -114,14 +114,32 @@ class TestAccountCoordinator:
     async def test_statistics_failure_does_not_fail_the_update(self):
         api = _api()
         coordinator = _coordinator(api)
-        coordinator.statistics = MagicMock(
-            async_import_account=AsyncMock(side_effect=RuntimeError("recorder down"))
+        coordinator.history = SimpleNamespace(
+            async_refresh=AsyncMock(side_effect=RuntimeError("recorder down")),
+            status=lambda _account: {},
         )
         with patch.object(coord_mod, "process_api_data", new=_processed(None)):
             data = await coordinator._async_update_data()
 
         assert ACCOUNT in data
-        coordinator.statistics.async_import_account.assert_awaited_once()
+        coordinator.history.async_refresh.assert_awaited_once()
+
+    async def test_history_handles_all_accounts_once_and_exposes_progress(self):
+        coordinator = _coordinator(_api(), accounts=("A-1", "A-2"))
+        coordinator.history = SimpleNamespace(
+            async_refresh=AsyncMock(),
+            status=lambda _account: {"electricity": {"state": "downloading"}},
+        )
+        coordinator.statistics.async_import_account = AsyncMock()
+        with patch.object(coord_mod, "process_api_data", new=_processed(None)):
+            data = await coordinator._async_update_data()
+        assert set(coordinator.history.async_refresh.await_args.args[0]) == {
+            "A-1",
+            "A-2",
+        }
+        assert data["A-1"]["history_sync"]["electricity"]["state"] == "downloading"
+        # Cached recent sensor readings are not a competing statistics writer.
+        coordinator.statistics.async_import_account.assert_not_awaited()
 
     async def test_public_products_refreshed_when_empty(self):
         api = _api()

@@ -271,6 +271,7 @@ query GasMeterReadings(
   $dateTo: Date
   $first: Int
   $last: Int
+  $after: String
 ) {
   gasMeterReadings(
     accountNumber: $accountNumber
@@ -279,7 +280,9 @@ query GasMeterReadings(
     dateTo: $dateTo
     first: $first
     last: $last
+    after: $after
   ) {
+    pageInfo { hasNextPage endCursor }
     edges {
       node {
         readingDate
@@ -301,6 +304,7 @@ query ElectricityMeasurements(
   $endOn: Date
   $first: Int
   $last: Int
+  $after: String
 ) {
   property(id: $propertyId) {
     measurements(
@@ -308,6 +312,7 @@ query ElectricityMeasurements(
       endOn: $endOn
       first: $first
       last: $last
+      after: $after
       utilityFilters: [
         {
           electricityFilters: {
@@ -318,6 +323,7 @@ query ElectricityMeasurements(
         }
       ]
     ) {
+      pageInfo { hasNextPage endCursor }
       edges {
         node {
           value
@@ -1933,7 +1939,22 @@ class OctopusEnergyIT:
             )
             return []
 
-        edges = readings_data.get("edges") or []
+        readings = self._parse_gas_readings(readings_data)
+        if readings:
+            latest = readings[0]
+            _LOGGER.debug(
+                "Fetched gas meter reading: %s on %s (type: %s, source: %s)",
+                latest.get("value"),
+                latest.get("readingDate"),
+                latest.get("readingType"),
+                latest.get("readingSource"),
+            )
+
+        return readings
+
+    def _parse_gas_readings(self, connection: dict) -> list[dict]:
+        """Normalize gas reading nodes for both recent and historical requests."""
+        edges = connection.get("edges") or []
         readings: list[dict] = []
         for edge in edges:
             node = (edge or {}).get("node") or {}
@@ -1948,16 +1969,6 @@ class OctopusEnergyIT:
                     "unit": "m3",
                     "raw": node,
                 }
-            )
-
-        if readings:
-            latest = readings[0]
-            _LOGGER.debug(
-                "Fetched gas meter reading: %s on %s (type: %s, source: %s)",
-                latest.get("value"),
-                latest.get("readingDate"),
-                latest.get("readingType"),
-                latest.get("readingSource"),
             )
 
         return readings
@@ -2041,7 +2052,28 @@ class OctopusEnergyIT:
 
         property_data = response.get("data", {}).get("property") or {}
         measurements_data = property_data.get("measurements") or {}
-        edges = measurements_data.get("edges") or []
+        measurements = self._parse_electricity_readings(measurements_data)
+        if measurements:
+            latest = measurements[-1] if last else measurements[0]
+            _LOGGER.debug(
+                "Fetched electricity measurement: %s %s at %s (source: %s)",
+                latest.get("value"),
+                latest.get("unit"),
+                latest.get("readAt"),
+                latest.get("source"),
+            )
+        else:
+            _LOGGER.debug(
+                "No electricity measurements found for property %s, POD %s",
+                property_id,
+                pod,
+            )
+
+        return measurements
+
+    def _parse_electricity_readings(self, connection: dict) -> list[dict]:
+        """Normalize electricity nodes for recent and historical requests."""
+        edges = connection.get("edges") or []
 
         measurements: list[dict] = []
         for edge in edges:
@@ -2066,23 +2098,74 @@ class OctopusEnergyIT:
                 }
             )
 
-        if measurements:
-            latest = measurements[-1] if last else measurements[0]
-            _LOGGER.debug(
-                "Fetched electricity measurement: %s %s at %s (source: %s)",
-                latest.get("value"),
-                latest.get("unit"),
-                latest.get("readAt"),
-                latest.get("source"),
+        return measurements
+
+    async def fetch_readings_page(
+        self,
+        kind: str,
+        account_number: str,
+        supply_point: str,
+        *,
+        property_id: str | None,
+        start_on: str,
+        end_on: str,
+        after: str | None = None,
+    ) -> tuple[list[dict], str | None]:
+        """Fetch one history page; failures must not look like empty history.
+
+        The caller checkpoints successful pages and limits request frequency.
+        Fifty nodes are below Kraken's documented 100-node page limit.
+        """
+        variables = {"first": 50, "after": after}
+        if kind == "electricity":
+            query = PROPERTY_ELECTRICITY_MEASUREMENTS_QUERY
+            variables.update(
+                propertyId=property_id, pod=supply_point, startOn=start_on, endOn=end_on
+            )
+        elif kind == "gas":
+            query = GAS_METER_READINGS_QUERY
+            variables.update(
+                accountNumber=account_number,
+                pdr=supply_point,
+                dateFrom=start_on,
+                dateTo=end_on,
             )
         else:
-            _LOGGER.debug(
-                "No electricity measurements found for property %s, POD %s",
-                property_id,
-                pod,
+            raise ValueError("Unsupported reading history kind")
+        response = await self._execute_graphql(query, variables=variables)
+        if not isinstance(response, dict) or response.get("errors"):
+            raise OctopusEnergyITConnectionError("Historical readings request failed")
+        data = response.get("data") or {}
+        connection = (
+            (data.get("property") or {}).get("measurements")
+            if kind == "electricity"
+            else data.get("gasMeterReadings")
+        )
+        if not isinstance(connection, dict) or "edges" not in connection:
+            raise OctopusEnergyITConnectionError(
+                "Missing historical readings connection"
             )
-
-        return measurements
+        page = connection.get("pageInfo")
+        if not isinstance(page, dict) or not isinstance(page.get("hasNextPage"), bool):
+            raise OctopusEnergyITConnectionError(
+                "Missing historical readings pagination"
+            )
+        cursor = page.get("endCursor") if page["hasNextPage"] else None
+        if page["hasNextPage"] and (
+            not isinstance(cursor, str) or not cursor or cursor == after
+        ):
+            raise OctopusEnergyITConnectionError(
+                "Historical readings cursor did not advance"
+            )
+        readings = (
+            self._parse_electricity_readings(connection)
+            if kind == "electricity"
+            else self._parse_gas_readings(connection)
+        )
+        # Raw copies are only useful for diagnostics, not persistent backfill.
+        return [
+            {k: v for k, v in reading.items() if k != "raw"} for reading in readings
+        ], cursor
 
     async def fetch_last_charging_session(
         self, account_number: str, device_id: str

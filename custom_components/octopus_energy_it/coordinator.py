@@ -16,6 +16,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import DOMAIN, UPDATE_INTERVAL
 from .data_processor import process_api_data
+from .history import HistorySync
 from .octopus_energy_it import OctopusEnergyIT
 from .statistics import StatisticsImporter
 from .tariff_scraper import fetch_public_tariffs
@@ -115,6 +116,7 @@ class OctopusEnergyITDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]
         self.account_numbers = account_numbers
         self.public_products_coordinator = public_products_coordinator
         self.statistics = StatisticsImporter(hass)
+        self.history = HistorySync(hass, entry.entry_id, api, self.statistics)
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data for all accounts; failing accounts are skipped."""
@@ -147,15 +149,12 @@ class OctopusEnergyITDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]
             update_device_reauth_issues(
                 self.hass, processed[account_number].get("devices")
             )
-            try:
-                await self.statistics.async_import_account(
-                    account_number, processed[account_number]
-                )
-            except Exception:
-                # Statistics are a best-effort extra: never fail the update.
-                _LOGGER.exception(
-                    "Failed to import statistics for account %s", account_number
-                )
+        try:
+            await self.history.async_refresh(all_accounts_data)
+        except Exception:
+            _LOGGER.exception("Unable to load historical reading sync state")
+        for account_number, account in all_accounts_data.items():
+            account["history_sync"] = self.history.status(account_number)
 
         if self.api.auth_failed:
             # The stored password was rejected: start the reauth flow.

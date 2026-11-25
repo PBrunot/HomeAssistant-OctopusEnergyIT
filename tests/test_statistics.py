@@ -256,9 +256,10 @@ class TestStatisticsImporter:
             "electricity_consumption_charge": 0.2,
             "current_electricity_product": {"isTimeOfUse": False},
         }
-        await StatisticsImporter(_hass()).async_import_account("A-1", account)
+        written = await StatisticsImporter(_hass()).async_import_account("A-1", account)
 
         (energy_meta, energy_rows), (cost_meta, cost_rows) = recorder.added
+        assert written == 4  # baseline + daily row for energy and cost
         assert (
             energy_meta["statistic_id"]
             == "octopus_energy_it:a_1_electricity_consumption"

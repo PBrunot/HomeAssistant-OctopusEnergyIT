@@ -2,8 +2,13 @@
 
 ## Unreleased
 
+### Added
+- Initial electricity and gas history backfill over the previous 12 calendar months, followed by a rolling 30-day refresh every 30 minutes. Downloads use 50-reading GraphQL pages at most once per 30 seconds across accounts and supplies, with persisted checkpoints, retries, restart recovery and catch-up after longer outages.
+- English and Italian Home Assistant notifications for initial backfill progress, completion, corrections and automatic retries. Unchanged routine refreshes do not create notifications. INFO logs and diagnostics expose download progress.
+
 ### Fixed
-- Reconcile downloaded historical readings with recorder: delayed daily readings replace earlier estimates, revisions overwrite the covered days, and subsequent cumulative sums are adjusted without changing those later days' consumption. Skip incomplete boundary days and unchanged downloads. Document the timestamp conversion and the actual backfill window (10 electricity measurements / 5 gas readings, not a fixed number of days).
+- The historical importer is the sole writer of external energy statistics, preventing cached recent sensor readings from undoing fresh GraphQL corrections. Complete download ranges are reconciled only after all pages arrive; failed or partial requests do not advance the saved completion point.
+- Reconcile downloaded historical readings with recorder: delayed daily readings replace earlier estimates, revisions overwrite the covered days, and subsequent cumulative sums are adjusted without changing those later days' consumption. Skip incomplete boundary days and unchanged downloads, and document the timestamp conversion.
 - Historical Energy dashboard statistics include a zero baseline so the first imported day's consumption is counted. Multi-day reading intervals are allocated across their local days as estimates, including daylight-saving changes, instead of booking the entire interval on its first day.
 - Duplicate reading timestamps use the last supplied revision; invalid, negative and non-finite register values are ignored without aborting the account's statistics import.
 - Document that external statistics require 1.3.0b1 or later, explain how to select them instead of the latest-reading sensor, and clarify the recent-history and current-price cost limitations.
