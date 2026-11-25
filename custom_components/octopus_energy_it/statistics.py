@@ -7,16 +7,17 @@ external statistics. Daily consumption is booked at local midnight of the
 day it belongs to. Longer intervals are estimated across their local days,
 in proportion to elapsed time; they are not actual daily measurements.
 
-Imports are incremental and idempotent: only periods after the last stored
-statistic are written, continuing from its ``sum``. Home Assistant updates,
-rather than duplicates, a statistic written again for the same start.
+Downloaded periods replace previously imported periods, including estimates.
+Older totals are preserved and subsequent sums are adjusted when necessary.
+Home Assistant updates a statistic written again for the same start.
 """
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 import itertools
 import logging
 import math
@@ -31,7 +32,7 @@ from homeassistant.components.recorder.models import (
 )
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
-    get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -140,27 +141,67 @@ def readings_to_points(
     return points
 
 
+def reconcile_rows(
+    downloaded: list[dict[str, Any]], stored: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Replace downloaded days and propagate corrections to later sums.
+
+    The downloaded baseline is relative to zero. Anchor it to the last
+    recorder sum before the first downloaded day, then recalculate every
+    downloaded day. A changed total also shifts later stored sums, retaining
+    those days' consumption even if this response ends before they do.
+    """
+    if len(downloaded) < 2:
+        return []
+    first_day = downloaded[1]["start"]
+    last_day = downloaded[-1]["start"]
+    previous = sorted(stored, key=lambda row: row["start"])
+    preceding = [row for row in previous if row["start"] < first_day]
+    offset = preceding[-1]["sum"] if preceding else 0.0
+    replacement = [
+        {"start": row["start"], "sum": round(row["sum"] + offset, 6)}
+        for row in downloaded[1:]
+    ]
+    if not preceding:
+        replacement.insert(0, downloaded[0])
+    # An older import may have left a baseline within the newly covered
+    # range. Flatten such intermediate rows rather than leaving a dip.
+    new_starts = [row["start"] for row in replacement]
+    new_values = [row["sum"] for row in replacement]
+    replacement.extend(
+        {
+            "start": row["start"],
+            "sum": new_values[bisect_right(new_starts, row["start"]) - 1],
+        }
+        for row in previous
+        if first_day <= row["start"] <= last_day and row["start"] not in new_starts
+    )
+    earlier = [row for row in previous if row["start"] <= last_day]
+    old_total = earlier[-1]["sum"] if earlier else 0.0
+    adjustment = downloaded[-1]["sum"] + offset - old_total
+    replacement.extend(
+        {"start": row["start"], "sum": round(row["sum"] + adjustment, 6)}
+        for row in previous
+        if row["start"] > last_day
+    )
+    existing = {row["start"]: row["sum"] for row in previous}
+    return [
+        row
+        for row in sorted(replacement, key=lambda row: row["start"])
+        if row["start"] not in existing
+        or not math.isclose(
+            row["sum"], existing[row["start"]], abs_tol=0.0000005, rel_tol=0
+        )
+    ]
+
+
 class StatisticsImporter:
-    """Import the statistics of one config entry, remembering each cursor."""
+    """Import and reconcile the downloaded periods of one config entry."""
 
     def __init__(self, hass: HomeAssistant) -> None:
-        """Start with no cached cursors; they are read from the recorder once."""
+        """Remember unchanged downloads to avoid recorder work on every poll."""
         self._hass = hass
-        self._cursors: dict[str, Cursor] = {}
-
-    async def _cursor(self, stat_id: str) -> Cursor:
-        if (cursor := self._cursors.get(stat_id)) is not None:
-            return cursor
-        last = await get_instance(self._hass).async_add_executor_job(
-            get_last_statistics, self._hass, 1, stat_id, True, {"sum"}
-        )
-        rows = (last or {}).get(stat_id) or []
-        cursor = Cursor()
-        if rows:
-            row = rows[0]
-            cursor = Cursor(dt_util.utc_from_timestamp(row["start"]), row["sum"] or 0.0)
-        self._cursors[stat_id] = cursor
-        return cursor
+        self._downloads: dict[str, tuple[Any, ...]] = {}
 
     async def async_import(
         self,
@@ -172,12 +213,63 @@ class StatisticsImporter:
         unit_class: str | None,
         multiplier: float = 1.0,
     ) -> int:
-        """Import new rows of one series; return how many were written."""
+        """Overwrite changed downloaded days; return how many rows were written."""
         stat_id = statistic_id(account_number, kind)
-        rows, cursor = period_rows(
-            points, await self._cursor(stat_id), multiplier=multiplier
+        fingerprint = (
+            tuple(sorted(dict(points).items())),
+            unit,
+            unit_class,
+            multiplier,
+        )
+        if self._downloads.get(stat_id) == fingerprint:
+            return 0
+        downloaded, _ = period_rows(points, Cursor(), multiplier=multiplier)
+        if not downloaded:
+            return 0
+        # A sliding response starting/ending within a day cannot replace
+        # that whole day's total. Reconcile only fully covered local days.
+        first_read = min(point[0] for point in points)
+        first_local_day = dt_util.as_local(first_read).date()
+        first_day = dt_util.as_utc(dt_util.start_of_local_day(first_local_day))
+        if first_read > first_day:
+            first_day = dt_util.as_utc(
+                dt_util.start_of_local_day(first_local_day + timedelta(days=1))
+            )
+        end_day = dt_util.as_utc(
+            dt_util.start_of_local_day(dt_util.as_local(max(t for t, _ in points)))
+        )
+        complete = [
+            row for row in downloaded[1:] if first_day <= row["start"] < end_day
+        ]
+        if not complete:
+            return 0
+        base = next(
+            row["sum"] for row in reversed(downloaded) if row["start"] < first_day
+        )
+        downloaded = [{"start": first_day - timedelta(hours=1), "sum": 0.0}] + [
+            {"start": row["start"], "sum": round(row["sum"] - base, 6)}
+            for row in complete
+        ]
+        stored = await get_instance(self._hass).async_add_executor_job(
+            statistics_during_period,
+            self._hass,
+            datetime(1970, 1, 1, tzinfo=UTC),
+            None,
+            {stat_id},
+            "hour",
+            {unit_class: unit} if unit_class else None,
+            {"sum"},
+        )
+        rows = reconcile_rows(
+            downloaded,
+            [
+                {"start": dt_util.utc_from_timestamp(row["start"]), "sum": row["sum"]}
+                for row in (stored or {}).get(stat_id, [])
+                if row.get("sum") is not None
+            ],
         )
         if not rows:
+            self._downloads[stat_id] = fingerprint
             return 0
         metadata = StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
@@ -191,7 +283,7 @@ class StatisticsImporter:
         async_add_external_statistics(
             self._hass, metadata, [StatisticData(**row) for row in rows]
         )
-        self._cursors[stat_id] = cursor
+        self._downloads[stat_id] = fingerprint
         _LOGGER.debug("Imported %d rows into %s", len(rows), stat_id)
         return len(rows)
 

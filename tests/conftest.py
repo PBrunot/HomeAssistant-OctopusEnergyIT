@@ -416,6 +416,7 @@ def _install_stubs() -> None:
         _rec_stats = _stub("homeassistant.components.recorder.statistics")
         _rec_stats.async_add_external_statistics = MagicMock()
         _rec_stats.get_last_statistics = MagicMock(return_value={})
+        _rec_stats.statistics_during_period = MagicMock(return_value={})
 
     _sensor = _stub("homeassistant.components.sensor")
     if not hasattr(_sensor, "SensorEntity"):

@@ -16,6 +16,7 @@ from custom_components.octopus_energy_it.statistics import (
     StatisticsImporter,
     period_rows,
     readings_to_points,
+    reconcile_rows,
     statistic_id,
 )
 
@@ -143,6 +144,29 @@ class TestPeriodRows:
 
 
 class TestReadingsToPoints:
+    @pytest.mark.parametrize(
+        ("month", "utc_hour", "offset"), [(11, 23, "+01:00"), (7, 22, "+02:00")]
+    )
+    def test_graphql_offset_and_utc_timestamps_book_same_italian_day(
+        self, month, utc_hour, offset
+    ):
+        local = [
+            {"readAt": f"2026-{month:02d}-{day:02d}T00:00:00{offset}", "value": value}
+            for day, value in [(2, 100), (3, 115.7)]
+        ]
+        utc = [
+            {"readAt": f"2026-{month:02d}-{day:02d}T{utc_hour}:00:00Z", "value": value}
+            for day, value in [(1, 100), (2, 115.7)]
+        ]
+        local_rows, _ = period_rows(
+            readings_to_points(local, date_key="readAt"), Cursor()
+        )
+        utc_rows, _ = period_rows(readings_to_points(utc, date_key="readAt"), Cursor())
+        assert utc_rows == local_rows
+        assert utc_rows[-1]["start"] == _local_midnight(2026, month, 2)
+        assert utc_rows[-1]["sum"] == pytest.approx(15.7)
+        assert utc_rows[-1]["start"].tzinfo == UTC
+
     @pytest.mark.parametrize("value", ["invalid", "nan", "inf", "-inf", -1, {}, []])
     def test_invalid_numeric_values_are_skipped(self, value):
         assert (
@@ -196,12 +220,22 @@ def _electricity(*values):
 
 @pytest.fixture
 def recorder():
-    """Patch the recorder API; ``last`` holds what get_last_statistics returns."""
+    """Model recorder reads and upserts by statistic ID and UTC timestamp."""
     state = SimpleNamespace(last={}, added=[])
     instance = MagicMock()
 
     async def _executor(func, *args):
         return state.last
+
+    def _add(hass, meta, rows):
+        state.added.append((meta, rows))
+        stat_id = meta["statistic_id"]
+        existing = {row["start"]: row for row in state.last.get(stat_id, [])}
+        existing.update(
+            (row["start"].timestamp(), {**row, "start": row["start"].timestamp()})
+            for row in rows
+        )
+        state.last[stat_id] = sorted(existing.values(), key=lambda row: row["start"])
 
     instance.async_add_executor_job = AsyncMock(side_effect=_executor)
     with (
@@ -209,7 +243,7 @@ def recorder():
         patch.object(
             stats_mod,
             "async_add_external_statistics",
-            side_effect=lambda hass, meta, rows: state.added.append((meta, rows)),
+            side_effect=_add,
         ),
     ):
         yield state
@@ -268,7 +302,15 @@ class TestStatisticsImporter:
     async def test_resumes_from_recorder_and_caches_cursor(self, recorder):
         stat_id = "octopus_energy_it:a_1_electricity_consumption"
         recorder.last = {
-            stat_id: [{"start": _local_midnight(2026, 11, 1).timestamp(), "sum": 900.0}]
+            stat_id: [
+                {
+                    "start": (
+                        _local_midnight(2026, 11, 1) - timedelta(hours=1)
+                    ).timestamp(),
+                    "sum": 890.0,
+                },
+                {"start": _local_midnight(2026, 11, 1).timestamp(), "sum": 900.0},
+            ]
         }
         importer = StatisticsImporter(_hass())
         account = {"electricity_readings": _electricity(100.0, 110.0, 125.0)}
@@ -278,7 +320,7 @@ class TestStatisticsImporter:
 
         ((_meta, rows),) = recorder.added
         assert [row["sum"] for row in rows] == [915.0]
-        # The recorder is queried once; later polls use the cached cursor.
+        # The recorder is queried once; unchanged downloads are skipped.
         assert (
             stats_mod.get_instance.return_value.async_add_executor_job.await_count == 1
         )
@@ -286,3 +328,120 @@ class TestStatisticsImporter:
     async def test_nothing_to_import_without_readings(self, recorder):
         await StatisticsImporter(_hass()).async_import_account("A-1", {})
         assert recorder.added == []
+
+    async def test_delayed_daily_reading_overwrites_estimates(self, recorder):
+        importer = StatisticsImporter(_hass())
+        readings = _electricity(100.0, 106.0, 130.0)
+        stat_id = statistic_id("A-1", stats_mod.ELECTRICITY)
+        # The first download has a two-day gap: estimated 15 kWh each day.
+        await importer.async_import_account(
+            "A-1", {"electricity_readings": [readings[0], readings[2]]}
+        )
+        assert [r["sum"] for r in recorder.last[stat_id]] == [0, 15, 30]
+        # GraphQL later supplies the intermediate reading: actual 6 then 24.
+        await importer.async_import_account("A-1", {"electricity_readings": readings})
+        assert [r["sum"] for r in recorder.last[stat_id]] == [0, 6, 30]
+        assert [r["start"] for r in recorder.last[stat_id][1:]] == [
+            _local_midnight(2026, 11, 1).timestamp(),
+            _local_midnight(2026, 11, 2).timestamp(),
+        ]
+
+    async def test_correction_survives_restart_without_duplicate_totals(self, recorder):
+        stat_id = statistic_id("A-1", stats_mod.ELECTRICITY)
+        await StatisticsImporter(_hass()).async_import_account(
+            "A-1", {"electricity_readings": _electricity(100, 110, 125)}
+        )
+        # Recreate the importer (HA restart), and correct the middle reading.
+        importer = StatisticsImporter(_hass())
+        await importer.async_import_account(
+            "A-1", {"electricity_readings": _electricity(100, 108, 125)}
+        )
+        assert [r["sum"] for r in recorder.last[stat_id]] == [0, 8, 25]
+        count = len(recorder.added)
+        await StatisticsImporter(_hass()).async_import_account(
+            "A-1", {"electricity_readings": _electricity(100, 108, 125)}
+        )
+        assert len(recorder.added) == count
+
+    async def test_sliding_window_preserves_older_consumption(self, recorder):
+        stat_id = statistic_id("A-1", stats_mod.ELECTRICITY)
+        importer = StatisticsImporter(_hass())
+        await importer.async_import_account(
+            "A-1", {"electricity_readings": _electricity(100, 110, 125)}
+        )
+        readings = [
+            {"readAt": t.isoformat(), "value": v}
+            for t, v in _points(110, 125, 145, start_day=2)
+        ]
+        await importer.async_import_account("A-1", {"electricity_readings": readings})
+        assert [r["sum"] for r in recorder.last[stat_id]] == [0, 10, 25, 45]
+
+    async def test_partial_boundary_days_do_not_replace_complete_days(self, recorder):
+        stat_id = statistic_id("A-1", stats_mod.ELECTRICITY)
+        importer = StatisticsImporter(_hass())
+        await importer.async_import_account(
+            "A-1", {"electricity_readings": _electricity(100, 110, 125, 145)}
+        )
+        readings = [
+            {"readAt": "2026-11-01T12:00:00+01:00", "value": 105},
+            {"readAt": "2026-11-02T00:00:00+01:00", "value": 110},
+            {"readAt": "2026-11-03T00:00:00+01:00", "value": 120},
+            {"readAt": "2026-11-03T12:00:00+01:00", "value": 130},
+        ]
+        await importer.async_import_account("A-1", {"electricity_readings": readings})
+        # Only day 2 is completely covered and corrected (15 -> 10).
+        assert [r["sum"] for r in recorder.last[stat_id]] == [0, 10, 20, 40]
+
+    async def test_download_with_no_complete_days_leaves_recorder_untouched(
+        self, recorder
+    ):
+        readings = [
+            {"readAt": "2026-11-01T12:00:00+01:00", "value": 105},
+            {"readAt": "2026-11-01T18:00:00+01:00", "value": 110},
+        ]
+        await StatisticsImporter(_hass()).async_import_account(
+            "A-1", {"electricity_readings": readings}
+        )
+        assert recorder.added == []
+
+    async def test_failed_import_is_retried(self, recorder):
+        importer = StatisticsImporter(_hass())
+        readings = {"electricity_readings": _electricity(100, 110)}
+        with (
+            patch.object(
+                stats_mod,
+                "async_add_external_statistics",
+                side_effect=RuntimeError("recorder unavailable"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            await importer.async_import_account("A-1", readings)
+        await importer.async_import_account("A-1", readings)
+        assert len(recorder.added) == 1
+
+
+class TestReconcileRows:
+    def test_correction_adjusts_later_sums_without_changing_later_usage(self):
+        stored, _ = period_rows(_points(100, 110, 125, 140), Cursor())
+        downloaded, _ = period_rows(_points(100, 108, 120), Cursor())
+        rows = reconcile_rows(downloaded, stored)
+        assert [r["sum"] for r in rows] == [8, 20, 35]
+        assert rows[-1]["sum"] - rows[-2]["sum"] == 15
+
+    def test_identical_download_is_idempotent(self):
+        rows, _ = period_rows(_points(100, 110, 125), Cursor())
+        assert reconcile_rows(rows, rows) == []
+
+    def test_earlier_history_rebases_existing_later_totals(self):
+        stored, _ = period_rows(_points(110, 125, start_day=2), Cursor())
+        downloaded, _ = period_rows(_points(100, 110, 125), Cursor())
+        merged = {r["start"]: r["sum"] for r in stored}
+        merged.update(
+            (r["start"], r["sum"]) for r in reconcile_rows(downloaded, stored)
+        )
+        assert merged[_local_midnight(2026, 11, 1)] == 10
+        assert merged[_local_midnight(2026, 11, 2)] == 25
+        assert merged[_local_midnight(2026, 11, 2) - timedelta(hours=1)] == 10
+        assert all(
+            b >= a for a, b in itertools.pairwise(v for _, v in sorted(merged.items()))
+        )

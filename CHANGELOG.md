@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- Reconcile downloaded historical readings with recorder: delayed daily readings replace earlier estimates, revisions overwrite the covered days, and subsequent cumulative sums are adjusted without changing those later days' consumption. Skip incomplete boundary days and unchanged downloads. Document the timestamp conversion and the actual backfill window (10 electricity measurements / 5 gas readings, not a fixed number of days).
 - Historical Energy dashboard statistics include a zero baseline so the first imported day's consumption is counted. Multi-day reading intervals are allocated across their local days as estimates, including daylight-saving changes, instead of booking the entire interval on its first day.
 - Duplicate reading timestamps use the last supplied revision; invalid, negative and non-finite register values are ignored without aborting the account's statistics import.
 - Document that external statistics require 1.3.0b1 or later, explain how to select them instead of the latest-reading sensor, and clarify the recent-history and current-price cost limitations.
