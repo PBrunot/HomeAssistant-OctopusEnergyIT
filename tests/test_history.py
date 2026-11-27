@@ -123,6 +123,24 @@ async def test_failed_recorder_commit_does_not_mark_backfill_complete(env):
     assert "will retry automatically" in env.notify.call_args.args[1]
 
 
+async def test_daily_layout_series_is_downloaded_again_for_hourly_rows(env):
+    # Series completed before hourly statistics carry no layout marker.
+    env.data = {
+        f"{ACCOUNT}:electricity": {
+            "identity": [POD, "property"],
+            "last_start": "2026-10-24",
+            "last_end": "2026-11-24",
+            "next_refresh": env.now.timestamp() + 3600,
+            "readings": [_reading(23, 100)],
+        }
+    }
+    await env.new_sync().async_refresh(ACCOUNTS)
+    assert env.api.fetch_readings_page.await_args.kwargs["start_on"] == "2025-11-24"
+    state = env.data[f"{ACCOUNT}:electricity"]
+    assert state["layout"] == history_mod.STATISTICS_LAYOUT
+    assert state["last_end"] == "2026-11-25"
+
+
 async def test_initial_history_is_twelve_months_with_boundary_day(env):
     sync = env.new_sync()
     await sync.async_refresh(ACCOUNTS)
@@ -537,8 +555,11 @@ async def test_backfill_and_rolling_correction_reconcile_real_statistics_importe
     rome = ZoneInfo("Europe/Rome")
 
     def daily(day):
-        timestamp = datetime(2026, 11, day, tzinfo=rome).timestamp()
-        return next(r["sum"] for r in stored[stat_id] if r["start"] == timestamp)
+        """Running total at the end of *day* (the row of its last hour)."""
+        timestamp = datetime(2026, 11, day + 1, tzinfo=rome).timestamp() - 3600
+        return next(
+            round(r["sum"], 3) for r in stored[stat_id] if r["start"] == timestamp
+        )
 
     with (
         patch.object(statistics_mod, "get_instance", return_value=env.recorder),

@@ -26,6 +26,9 @@ _LOGGER = logging.getLogger(__name__)
 HISTORY_REFRESH = 30 * 60
 HISTORY_REQUEST_INTERVAL = 30
 CORRECTION_DAYS = 30
+# Statistics layout of the stored series. A change re-downloads twelve
+# months so previously imported rows are rewritten in the new layout.
+STATISTICS_LAYOUT = "hourly"
 
 
 def year_ago(day: date) -> date:
@@ -159,8 +162,11 @@ class HistorySync:
                 else None,
             ]
             state = self._series.get(key, {})
-            if state.get("identity") != identity:
-                state = {"identity": identity}
+            if (
+                state.get("identity") != identity
+                or state.get("layout") != STATISTICS_LAYOUT
+            ):
+                state = {"identity": identity, "layout": STATISTICS_LAYOUT}
             if not state.get("pending") and now.timestamp() < state.get(
                 "next_refresh", 0
             ):
