@@ -2,9 +2,7 @@
 
 from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
-import json
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
@@ -62,26 +60,11 @@ def env():
     )
     state.importer = SimpleNamespace(async_import_account=AsyncMock(return_value=2))
     state.recorder = SimpleNamespace(async_block_till_done=AsyncMock())
-    strings = json.loads(
-        (
-            Path(__file__).resolve().parent.parent
-            / "custom_components/octopus_energy_it/strings.json"
-        ).read_text(encoding="utf-8")
-    )
-    messages = {
-        f"component.octopus_energy_it.exceptions.{key}.message": item["message"]
-        for key, item in strings["exceptions"].items()
-    }
     with (
         patch.object(history_mod, "Store", return_value=state.store),
         patch.object(history_mod.dt_util, "utcnow", side_effect=lambda: state.now),
         patch.object(history_mod, "get_instance", return_value=state.recorder),
-        patch.object(
-            history_mod, "async_get_translations", new=AsyncMock(return_value=messages)
-        ),
-        patch.object(history_mod.persistent_notification, "async_create") as notify,
     ):
-        state.notify = notify
         state.new_sync = lambda: HistorySync(
             state.hass, "entry", state.api, state.importer
         )
@@ -120,7 +103,6 @@ async def test_failed_recorder_commit_does_not_mark_backfill_complete(env):
     await env.new_sync().async_refresh(ACCOUNTS)
     env.importer.async_import_account.assert_awaited_once()
     assert env.data is None
-    assert "will retry automatically" in env.notify.call_args.args[1]
 
 
 async def test_initial_history_is_twelve_months_with_boundary_day(env):
@@ -137,7 +119,7 @@ async def test_initial_history_is_twelve_months_with_boundary_day(env):
     )
     env.importer.async_import_account.assert_awaited_once()
     env.recorder.async_block_till_done.assert_awaited_once()
-    assert sync.status(ACCOUNT)["electricity"]["state"] == "ready"
+    assert sync.status(ACCOUNT)["electricity"]["state"] == "up_to_date"
     assert env.data[f"{ACCOUNT}:electricity"]["last_end"] == "2026-11-25"
 
 
@@ -148,9 +130,7 @@ async def test_no_history_work_before_home_assistant_started(env):
     env.api.fetch_readings_page.assert_not_awaited()
 
 
-async def test_initial_notifications_show_progress_and_complete_without_duplicates(
-    env, caplog
-):
+async def test_status_reports_initial_download_then_up_to_date(env, caplog):
     caplog.set_level(logging.INFO, logger=history_mod.__name__)
     env.api.fetch_readings_page.side_effect = [
         ([_reading(23, 100)], "next"),
@@ -158,69 +138,34 @@ async def test_initial_notifications_show_progress_and_complete_without_duplicat
     ]
     sync = env.new_sync()
     await sync.async_refresh(ACCOUNTS)
-    assert "Importing historical" in env.notify.call_args_list[0].args[1]
-    assert "Downloaded 1 pages" in env.notify.call_args_list[1].args[1]
+    status = sync.status(ACCOUNT)["electricity"]
+    assert status["state"] == "initial_download"
+    assert status["pages_downloaded"] == 1
+    assert status["next_refresh"] is None
     env.now += timedelta(seconds=30)
     await sync.async_refresh(ACCOUNTS)
-    assert "Historical import completed" in env.notify.call_args.args[1]
-    assert "2 statistic records" in env.notify.call_args.args[1]
-    assert (
-        len({call.kwargs["notification_id"] for call in env.notify.call_args_list}) == 1
-    )
-    assert all(
-        POD not in call.args[1] and ACCOUNT not in call.args[1]
-        for call in env.notify.call_args_list
-    )
+    status = sync.status(ACCOUNT)["electricity"]
+    assert status["state"] == "up_to_date"
+    assert status["last_rows_written"] == 2
+    assert status["last_completed"] == env.now.isoformat()
+    assert status["next_refresh"] == (env.now + timedelta(hours=1)).isoformat()
+    assert all(POD not in str(v) and ACCOUNT not in str(v) for v in status.values())
     assert "Starting historical electricity download" in caplog.text
     assert "Downloaded historical electricity page 1" in caplog.text
     assert "Historical electricity import complete" in caplog.text
 
 
-async def test_unchanged_rolling_refresh_does_not_create_notifications(env):
+async def test_rolling_refresh_reports_refreshing_not_initial(env):
     sync = env.new_sync()
     await sync.async_refresh(ACCOUNTS)
-    count = env.notify.call_count
-    env.now += timedelta(minutes=30)
-    env.importer.async_import_account.return_value = 0
+    env.now += timedelta(hours=1)
+    env.api.fetch_readings_page.return_value = ([_reading(24, 115)], "next")
     await sync.async_refresh(ACCOUNTS)
-    assert env.notify.call_count == count
+    assert sync.status(ACCOUNT)["electricity"]["state"] == "refreshing"
 
 
-async def test_rolling_correction_notifies_about_written_records(env):
-    sync = env.new_sync()
-    await sync.async_refresh(ACCOUNTS)
-    count = env.notify.call_count
-    env.now += timedelta(minutes=30)
-    env.importer.async_import_account.return_value = 3
-    await sync.async_refresh(ACCOUNTS)
-    assert env.notify.call_count == count + 1
-    assert "3 statistic records" in env.notify.call_args.args[1]
-
-
-async def test_notification_failure_does_not_interrupt_history(env):
-    with patch.object(
-        history_mod,
-        "async_get_translations",
-        new=AsyncMock(side_effect=RuntimeError("translation unavailable")),
-    ):
-        await env.new_sync().async_refresh(ACCOUNTS)
-    assert env.data[f"{ACCOUNT}:electricity"]["last_end"] == "2026-11-25"
-    env.importer.async_import_account.assert_awaited_once()
-
-
-@pytest.mark.parametrize("language", ["en", "it"])
-def test_history_notification_translations_have_compatible_placeholders(language):
-    root = (
-        Path(__file__).resolve().parent.parent / "custom_components/octopus_energy_it"
-    )
-    strings = json.loads(
-        (root / "translations" / f"{language}.json").read_text(encoding="utf-8")
-    )
-    for key, value in strings["exceptions"].items():
-        if key.startswith("history_"):
-            assert value["message"].format(
-                start="2025-11-25", end="2026-11-25", pages=1, readings=2, rows=3
-            )
+def test_history_module_creates_no_notifications():
+    assert not hasattr(history_mod, "persistent_notification")
 
 
 async def test_pages_are_checkpointed_and_imported_only_when_complete(env):
@@ -260,10 +205,10 @@ async def test_restart_resumes_saved_page_instead_of_restarting_backfill(env):
     )
 
 
-async def test_completed_backfill_refreshes_thirty_days_after_half_hour(env):
+async def test_completed_backfill_refreshes_thirty_days_after_an_hour(env):
     await env.new_sync().async_refresh(ACCOUNTS)
     sync = env.new_sync()
-    env.now += timedelta(minutes=29)
+    env.now += timedelta(minutes=59)
     await sync.async_refresh(ACCOUNTS)
     assert env.api.fetch_readings_page.await_count == 1
     env.now += timedelta(minutes=1)
@@ -294,12 +239,11 @@ async def test_failed_page_keeps_checkpoint_and_retries_same_cursor(env):
     assert env.data == checkpoint
     env.importer.async_import_account.assert_not_awaited()
     assert sync.status(ACCOUNT)["electricity"]["state"] == "retrying"
-    assert "will retry automatically" in env.notify.call_args.args[1]
     env.now += timedelta(seconds=30)
     await sync.async_refresh(ACCOUNTS)
     assert env.api.fetch_readings_page.await_args.kwargs["after"] == "page-2"
     env.importer.async_import_account.assert_awaited_once()
-    assert "Historical import completed" in env.notify.call_args.args[1]
+    assert sync.status(ACCOUNT)["electricity"]["state"] == "up_to_date"
 
 
 async def test_repeated_cursor_does_not_finish_or_advance_checkpoint(env):
@@ -370,7 +314,7 @@ async def test_sparse_gas_refresh_retains_preceding_reading(env):
     )
     sync = env.new_sync()
     await sync.async_refresh(accounts)
-    env.now += timedelta(minutes=30)
+    env.now += timedelta(hours=1)
     env.api.fetch_readings_page.return_value = (
         [{"readingDate": "2026-11-01", "value": 125}],
         None,
@@ -555,7 +499,7 @@ async def test_backfill_and_rolling_correction_reconcile_real_statistics_importe
         assert daily(23) - daily(22) == 15
         assert daily(23) == 115
         # The next complete 30-day download corrects the intermediate register.
-        env.now += timedelta(minutes=30)
+        env.now += timedelta(hours=1)
         await sync.async_refresh(ACCOUNTS)
         assert daily(23) - daily(22) == 10
         assert daily(23) == 115  # correction changes allocation, not the total

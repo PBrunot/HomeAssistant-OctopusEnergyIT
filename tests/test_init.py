@@ -128,7 +128,7 @@ class TestAccountCoordinator:
         coordinator = _coordinator(_api(), accounts=("A-1", "A-2"))
         coordinator.history = SimpleNamespace(
             async_refresh=AsyncMock(),
-            status=lambda _account: {"electricity": {"state": "downloading"}},
+            status=lambda _account: {"electricity": {"state": "initial_download"}},
         )
         coordinator.statistics.async_import_account = AsyncMock()
         with patch.object(coord_mod, "process_api_data", new=_processed(None)):
@@ -137,7 +137,7 @@ class TestAccountCoordinator:
             "A-1",
             "A-2",
         }
-        assert data["A-1"]["history_sync"]["electricity"]["state"] == "downloading"
+        assert data["A-1"]["history_sync"]["electricity"]["state"] == "initial_download"
         # Cached recent sensor readings are not a competing statistics writer.
         coordinator.statistics.async_import_account.assert_not_awaited()
 

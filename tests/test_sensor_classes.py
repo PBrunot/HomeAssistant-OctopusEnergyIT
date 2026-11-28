@@ -24,6 +24,7 @@ _RULES = {
         {None, "measurement", "total", "total_increasing"},
     ),
     "timestamp": (None, {None}),
+    "enum": ({None}, {None}),
 }
 
 _SENSOR_CLASSES = [

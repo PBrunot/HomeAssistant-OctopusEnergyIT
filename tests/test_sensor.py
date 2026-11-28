@@ -132,6 +132,8 @@ from custom_components.octopus_energy_it.sensor import (
     OctopusElectricityLastReadingSensor,
     OctopusEvNextDispatchEndSensor,
     OctopusEvNextDispatchStartSensor,
+    OctopusHistorySyncSensor,
+    _build_sensors_for_account,
     _effective_dispatch_window,
 )
 
@@ -411,3 +413,60 @@ class TestOctopusElectricityLastReadingSensor:
         # Reading dict has no end_register_value key at all
         sensor = self._sensor({"value": "42.0"})
         assert sensor.native_value is None
+
+
+# ---------------------------------------------------------------------------
+# OctopusHistorySyncSensor
+# ---------------------------------------------------------------------------
+
+
+class TestOctopusHistorySyncSensor:
+    """The history import state replaces persistent notifications."""
+
+    def _sensor(self, account_data, kind="electricity"):
+        sensor = _make_sensor(OctopusHistorySyncSensor, _make_coordinator(account_data))
+        sensor._kind = kind
+        return sensor
+
+    def test_state_and_attributes_come_from_history_status(self):
+        status = {
+            "state": "up_to_date",
+            "last_rows_written": 3,
+            "next_refresh": "2026-11-28T10:00:00+00:00",
+        }
+        sensor = self._sensor({"history_sync": {"electricity": status}})
+        assert sensor.native_value == "up_to_date"
+        assert sensor.extra_state_attributes == {
+            "last_rows_written": 3,
+            "next_refresh": "2026-11-28T10:00:00+00:00",
+        }
+
+    def test_supply_not_started_yet_is_waiting(self):
+        sensor = self._sensor({"history_sync": {}}, kind="gas")
+        assert sensor.native_value == "waiting"
+        assert sensor.extra_state_attributes == {}
+
+    def test_missing_account_is_unknown(self):
+        sensor = _make_sensor(OctopusHistorySyncSensor, MagicMock(data={}))
+        sensor._kind = "gas"
+        assert sensor.native_value is None
+
+    def test_created_once_per_imported_supply(self):
+        sensors = _build_sensors_for_account(
+            ACCOUNT,
+            _make_coordinator({}),
+            {
+                "electricity_pod": "pod",
+                "electricity_property_id": "property",
+                "gas_pdr": "pdr",
+            },
+        )
+        ids = sorted(
+            s._attr_unique_id
+            for s in sensors
+            if isinstance(s, OctopusHistorySyncSensor)
+        )
+        assert ids == [
+            f"octopus_{ACCOUNT}_electricity_history_sync",
+            f"octopus_{ACCOUNT}_gas_history_sync",
+        ]

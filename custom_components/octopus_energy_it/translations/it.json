@@ -45,24 +45,6 @@
     }
   },
   "exceptions": {
-    "history_electricity_title": {
-      "message": "Octopus: storico elettricità"
-    },
-    "history_gas_title": {
-      "message": "Octopus: storico gas"
-    },
-    "history_sync_started": {
-      "message": "Importazione delle letture storiche dal {start} al {end}. Potrebbero essere necessari alcuni minuti."
-    },
-    "history_sync_progress": {
-      "message": "Scaricate {pages} pagine ({readings} letture) per il periodo dal {start} al {end}. Le statistiche vengono aggiornate al termine del download."
-    },
-    "history_sync_complete": {
-      "message": "Importazione storica completata dal {start} al {end}: elaborate {readings} letture e aggiunti o corretti {rows} record statistici. I consumi sono attribuiti alle date delle letture."
-    },
-    "history_sync_retry": {
-      "message": "L'importazione storica è stata interrotta e verrà ritentata automaticamente. I progressi salvati del download vengono conservati. Consulta i log di Octopus Energy Italy per i dettagli."
-    },
     "charge_target_update_failed": {
       "message": "Impossibile aggiornare il target di carica. Controlla i log per i dettagli."
     },
@@ -275,6 +257,26 @@
       },
       "last_charging_session": {
         "name": "Ultima sessione di ricarica"
+      },
+      "electricity_history_sync": {
+        "name": "Importazione storico elettricità",
+        "state": {
+          "waiting": "In attesa",
+          "initial_download": "Download iniziale",
+          "refreshing": "Aggiornamento",
+          "up_to_date": "Aggiornato",
+          "retrying": "Nuovo tentativo"
+        }
+      },
+      "gas_history_sync": {
+        "name": "Importazione storico gas",
+        "state": {
+          "waiting": "In attesa",
+          "initial_download": "Download iniziale",
+          "refreshing": "Aggiornamento",
+          "up_to_date": "Aggiornato",
+          "retrying": "Nuovo tentativo"
+        }
       }
     },
     "binary_sensor": {

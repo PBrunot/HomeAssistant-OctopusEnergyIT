@@ -1,19 +1,16 @@
-"""Resumable reading history: twelve months initially, then thirty-day refreshes."""
+"""Resumable reading history: twelve months initially, then hourly thirty-day refreshes."""
 
 from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
 from datetime import date, timedelta
-from hashlib import sha256
 import logging
 from typing import Any
 
-from homeassistant.components import persistent_notification
 from homeassistant.components.recorder import get_instance
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
-from homeassistant.helpers.translation import async_get_translations
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
@@ -23,9 +20,16 @@ from .statistics import StatisticsImporter, readings_to_points
 
 _LOGGER = logging.getLogger(__name__)
 
-HISTORY_REFRESH = 30 * 60
+HISTORY_REFRESH = 60 * 60
 HISTORY_REQUEST_INTERVAL = 30
 CORRECTION_DAYS = 30
+HISTORY_STATES = [
+    "waiting",
+    "initial_download",
+    "refreshing",
+    "up_to_date",
+    "retrying",
+]
 
 
 def year_ago(day: date) -> date:
@@ -76,33 +80,16 @@ class HistorySync:
         self._api = api
         self._importer = importer
         self._store = Store(hass, 1, f"{DOMAIN}.{entry_id}.history")
-        self._notification_prefix = f"{DOMAIN}_history_{entry_id}"
         self._series: dict[str, Any] | None = None
         self._next_request = 0.0
         self._position = 0
         self._errors: set[str] = set()
 
-    async def _async_notify(
-        self, key: str, kind: str, message_key: str, **values: Any
-    ) -> None:
-        """Update one translated HA notification per supply instead of adding alerts."""
-        try:
-            messages = await async_get_translations(
-                self._hass, self._hass.config.language, "exceptions", {DOMAIN}
-            )
-            prefix = f"component.{DOMAIN}.exceptions."
-            persistent_notification.async_create(
-                self._hass,
-                messages[f"{prefix}{message_key}.message"].format(**values),
-                title=messages[f"{prefix}history_{kind}_title.message"],
-                notification_id=f"{self._notification_prefix}_{sha256(key.encode()).hexdigest()[:12]}",
-            )
-        except Exception:
-            # Notification failures must not interrupt downloads or checkpoints.
-            _LOGGER.exception("Unable to update historical import notification")
-
     def status(self, account_number: str) -> dict[str, Any]:
-        """Return progress without account numbers, supply IDs or raw readings."""
+        """Return progress without account numbers, supply IDs or raw readings.
+
+        ``state`` is one of HISTORY_STATES and backs the history sync sensors.
+        """
         result = {}
         for kind in ("electricity", "gas"):
             key = f"{account_number}:{kind}"
@@ -110,12 +97,18 @@ class HistorySync:
             if not state:
                 continue
             pending = state.get("pending")
+            if key in self._errors:
+                phase = "retrying"
+            elif pending and pending.get("initial", not state.get("last_end")):
+                phase = "initial_download"
+            elif pending:
+                phase = "refreshing"
+            else:
+                phase = "up_to_date"
+            last_completed = state.get("last_completed")
+            next_refresh = state.get("next_refresh")
             result[kind] = {
-                "state": "retrying"
-                if key in self._errors
-                else "downloading"
-                if pending
-                else "ready",
+                "state": phase,
                 "requested_start": pending["start"]
                 if pending
                 else state.get("last_start"),
@@ -124,7 +117,13 @@ class HistorySync:
                 "readings_downloaded": len(pending["readings"])
                 if pending
                 else len(state.get("readings", [])),
-                "next_refresh": state.get("next_refresh"),
+                "last_completed": dt_util.utc_from_timestamp(last_completed).isoformat()
+                if last_completed
+                else None,
+                "last_rows_written": state.get("last_rows_written"),
+                "next_refresh": dt_util.utc_from_timestamp(next_refresh).isoformat()
+                if next_refresh and not pending
+                else None,
             }
         return result
 
@@ -176,7 +175,6 @@ class HistorySync:
                 _LOGGER.exception(
                     "Historical %s sync failed; the page will be retried", kind
                 )
-                await self._async_notify(key, kind, "history_sync_retry")
             else:
                 self._errors.discard(key)
             return
@@ -205,7 +203,7 @@ class HistorySync:
                 "cursor": None,
                 "seen": [],
                 "readings": [],
-                "notify": not state.get("last_end"),
+                "initial": not state.get("last_end"),
             }
             _LOGGER.info(
                 "Starting historical %s download: %s to %s",
@@ -213,16 +211,7 @@ class HistorySync:
                 state["pending"]["start"],
                 state["pending"]["end"],
             )
-            if state["pending"]["notify"]:
-                await self._async_notify(
-                    key,
-                    kind,
-                    "history_sync_started",
-                    start=state["pending"]["start"],
-                    end=state["pending"]["end"],
-                )
         pending = state["pending"]
-        pending["notify"] = pending.get("notify", False) or key in self._errors
         readings, cursor = await self._api.fetch_readings_page(
             kind,
             account_number,
@@ -244,16 +233,6 @@ class HistorySync:
         if cursor is not None:
             pending["seen"].append(cursor)
             pending["cursor"] = cursor
-            if pending["notify"]:
-                await self._async_notify(
-                    key,
-                    kind,
-                    "history_sync_progress",
-                    pages=len(pending["seen"]),
-                    readings=len(pending["readings"]),
-                    start=pending["start"],
-                    end=pending["end"],
-                )
         else:
             combined = merge_readings(
                 state.get("readings", []), pending["readings"], kind
@@ -277,11 +256,14 @@ class HistorySync:
             # Persist completion only after recorder has processed the writes.
             async with asyncio.timeout(30):
                 await get_instance(self._hass).async_block_till_done()
+            completed = dt_util.utcnow().timestamp()
             state.update(
                 readings=combined,
                 last_start=pending["start"],
                 last_end=pending["end"],
-                next_refresh=dt_util.utcnow().timestamp() + HISTORY_REFRESH,
+                last_completed=completed,
+                last_rows_written=written,
+                next_refresh=completed + HISTORY_REFRESH,
                 pending=None,
             )
             _LOGGER.info(
@@ -294,13 +276,3 @@ class HistorySync:
         updated = {**self._series, key: state}
         await self._store.async_save(updated)
         self._series = updated
-        if cursor is None and (pending["notify"] or written):
-            await self._async_notify(
-                key,
-                kind,
-                "history_sync_complete",
-                readings=len(combined),
-                rows=written,
-                start=pending["start"],
-                end=pending["end"],
-            )

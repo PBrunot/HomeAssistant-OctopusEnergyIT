@@ -3,8 +3,8 @@
 ## Unreleased
 
 ### Added
-- Initial electricity and gas history backfill over the previous 12 calendar months, followed by a rolling 30-day refresh every 30 minutes. Downloads use 50-reading GraphQL pages at most once per 30 seconds across accounts and supplies, with persisted checkpoints, retries, restart recovery and catch-up after longer outages.
-- English and Italian Home Assistant notifications for initial backfill progress, completion, corrections and automatic retries. Unchanged routine refreshes do not create notifications. INFO logs and diagnostics expose download progress.
+- Initial electricity and gas history backfill over the previous 12 calendar months, followed by a rolling 30-day refresh every hour. Downloads use 50-reading GraphQL pages at most once per 30 seconds across accounts and supplies, with persisted checkpoints, retries, restart recovery and catch-up after longer outages.
+- Diagnostic sensors *Electricity history import* and *Gas history import* report the import state (`waiting`, `initial_download`, `refreshing`, `up_to_date`, `retrying`) with the requested range, pages and readings downloaded, last completion, statistic rows last written and next refresh as attributes. The import no longer creates Home Assistant notifications. INFO logs and diagnostics also expose download progress.
 
 ### Fixed
 - The historical importer is the sole writer of external energy statistics, preventing cached recent sensor readings from undoing fresh GraphQL corrections. Complete download ranges are reconciled only after all pages arrive; failed or partial requests do not advance the saved completion point.

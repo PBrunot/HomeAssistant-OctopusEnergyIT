@@ -12,13 +12,14 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfTime
+from homeassistant.const import EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.dt import as_utc, parse_datetime as _parse_dt, utcnow
 
 from .data_processor import device_battery_size_kwh, device_model
 from .entity import OctopusCoordinatorEntity, OctopusPublicProductsEntity, boost_flags
+from .history import HISTORY_STATES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -249,6 +250,11 @@ def _build_sensors_for_account(  # noqa: C901 - flat list of optional sensors
                 OctopusElectricityProductInfoSensor(account_number, coordinator)
             )
 
+        if account_data.get("electricity_property_id"):
+            sensors.append(
+                OctopusHistorySyncSensor(account_number, coordinator, "electricity")
+            )
+
     if account_data.get("gas_pdr"):
         if account_data.get("gas_balance") is not None:
             sensors.append(OctopusGasBalanceSensor(account_number, coordinator))
@@ -286,6 +292,8 @@ def _build_sensors_for_account(  # noqa: C901 - flat list of optional sensors
 
         if account_data.get("current_gas_product"):
             sensors.append(OctopusGasProductInfoSensor(account_number, coordinator))
+
+        sensors.append(OctopusHistorySyncSensor(account_number, coordinator, "gas"))
 
     devices = account_data.get("devices") or []
     if devices:
@@ -949,6 +957,39 @@ class OctopusElectricityMeterStatusSensor(OctopusCoordinatorEntity, SensorEntity
                 or account_data.get("electricity_supply_point") is not None
             )
         )
+
+
+class OctopusHistorySyncSensor(OctopusCoordinatorEntity, SensorEntity):
+    """Historical statistics import status for one supply (replaces notifications)."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = HISTORY_STATES
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:database-sync"
+
+    def __init__(self, account_number, coordinator, kind: str) -> None:
+        super().__init__(account_number, coordinator)
+        self._kind = kind
+        self._attr_translation_key = f"{kind}_history_sync"
+        self._attr_unique_id = f"octopus_{account_number}_{kind}_history_sync"
+
+    def _status(self) -> dict[str, Any] | None:
+        account_data = _get_account_data(self.coordinator, self._account_number)
+        if not account_data:
+            return None
+        return (account_data.get("history_sync") or {}).get(self._kind) or {}
+
+    @property
+    def native_value(self) -> str | None:
+        status = self._status()
+        if status is None:
+            return None
+        return status.get("state", "waiting")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        status = self._status() or {}
+        return {key: value for key, value in status.items() if key != "state"}
 
 
 class OctopusHeatBalanceSensor(OctopusCoordinatorEntity, SensorEntity):
