@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import itertools
+import math
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -14,6 +15,7 @@ from custom_components.octopus_energy_it import statistics as stats_mod
 from custom_components.octopus_energy_it.statistics import (
     Cursor,
     StatisticsImporter,
+    collapse_to_midnight,
     period_rows,
     readings_to_points,
     reconcile_rows,
@@ -422,6 +424,48 @@ class TestStatisticsImporter:
 
 
 class TestReconcileRows:
+    @staticmethod
+    def _hourly_layout(days, per_day=10.0):
+        """Rows left by the hourly build: a day's usage spread over 24 rows."""
+        rows = [{"start": _local_midnight(2026, 11, 1) - timedelta(hours=1), "sum": 0}]
+        for index, day in enumerate(days):
+            midnight = _local_midnight(2026, 11, day)
+            rows.extend(
+                {
+                    "start": midnight + timedelta(hours=hour),
+                    "sum": per_day * index + per_day * (hour + 1) / 24,
+                }
+                for hour in range(24)
+            )
+        return rows
+
+    def test_hourly_rows_are_zeroed_except_midnight_across_all_history(self):
+        stored = self._hourly_layout(range(1, 6))
+        # Download covers only Nov 3-4; Nov 1-2 precede it and Nov 5 follows.
+        downloaded, _ = period_rows(_points(120, 130, 140, start_day=3), Cursor())
+        merged = {r["start"]: r["sum"] for r in stored}
+        merged.update(
+            (r["start"], r["sum"]) for r in reconcile_rows(downloaded, stored)
+        )
+        ordered = sorted(merged.items())
+        changes = {
+            start: round(total - previous, 6)
+            for (_, previous), (start, total) in itertools.pairwise(ordered)
+            if not math.isclose(total, previous)
+        }
+        assert changes == {_local_midnight(2026, 11, day): 10 for day in range(1, 6)}
+
+    def test_daily_history_is_already_collapsed(self):
+        stored, _ = period_rows(_points(100, 110, 125, 140), Cursor())
+        downloaded, _ = period_rows(_points(110, 125, start_day=2), Cursor())
+        assert reconcile_rows(downloaded, stored) == []
+
+    def test_collapse_moves_a_days_usage_to_its_first_row(self):
+        rows = self._hourly_layout([1])
+        collapsed = collapse_to_midnight(rows)
+        assert {r["sum"] for r in collapsed[1:]} == {10}
+        assert collapsed[0]["sum"] == 0
+
     def test_correction_adjusts_later_sums_without_changing_later_usage(self):
         stored, _ = period_rows(_points(100, 110, 125, 140), Cursor())
         downloaded, _ = period_rows(_points(100, 108, 120), Cursor())

@@ -12,6 +12,7 @@
 - Historical Energy dashboard statistics include a zero baseline so the first imported day's consumption is counted. Multi-day reading intervals are allocated across their local days as estimates, including daylight-saving changes, instead of booking the entire interval on its first day.
 - Duplicate reading timestamps use the last supplied revision; invalid, negative and non-finite register values are ignored without aborting the account's statistics import.
 - Document that external statistics require 1.3.0b1 or later, explain how to select them instead of the latest-reading sensor, and clarify the recent-history and current-price cost limitations.
+- Every imported energy and cost statistic keeps a day's consumption on its local-midnight row: all other hourly rows of that day are rewritten with zero change, across the whole recorded history. This removes the 24 hourly bars left by the reverted hourly-spread build on the next refresh, with no manual cleanup. The last downloaded day's later rows are no longer counted twice when subsequent sums are adjusted.
 - Allow HACS to download this fork directly from source, including `main`, instead of requiring a release ZIP asset.
 
 ## [1.3.0b1] - 2026-11-06

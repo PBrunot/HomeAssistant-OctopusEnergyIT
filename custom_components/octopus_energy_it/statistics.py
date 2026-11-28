@@ -10,6 +10,9 @@ in proportion to elapsed time; they are not actual daily measurements.
 Downloaded periods replace previously imported periods, including estimates.
 Older totals are preserved and subsequent sums are adjusted when necessary.
 Home Assistant updates a statistic written again for the same start.
+
+Every stored row that is not at local midnight is kept flat (zero change),
+so rows left by any earlier non-daily layout cannot add hourly bars.
 """
 
 from __future__ import annotations
@@ -150,11 +153,20 @@ def reconcile_rows(
     recorder sum before the first downloaded day, then recalculate every
     downloaded day. A changed total also shifts later stored sums, retaining
     those days' consumption even if this response ends before they do.
+    Finally every stored day is collapsed onto its midnight row: all rows of
+    a local day take that day's closing sum, so only midnight shows a change.
     """
     if len(downloaded) < 2:
         return []
     first_day = downloaded[1]["start"]
     last_day = downloaded[-1]["start"]
+    # Rows inside the last downloaded day belong to the replaced range, so
+    # its closing sum is not counted again when later rows are shifted.
+    range_end = dt_util.as_utc(
+        dt_util.start_of_local_day(
+            dt_util.as_local(last_day).date() + timedelta(days=1)
+        )
+    )
     previous = sorted(stored, key=lambda row: row["start"])
     preceding = [row for row in previous if row["start"] < first_day]
     offset = preceding[-1]["sum"] if preceding else 0.0
@@ -174,24 +186,45 @@ def reconcile_rows(
             "sum": new_values[bisect_right(new_starts, row["start"]) - 1],
         }
         for row in previous
-        if first_day <= row["start"] <= last_day and row["start"] not in new_starts
+        if first_day <= row["start"] < range_end and row["start"] not in new_starts
     )
-    earlier = [row for row in previous if row["start"] <= last_day]
+    earlier = [row for row in previous if row["start"] < range_end]
     old_total = earlier[-1]["sum"] if earlier else 0.0
     adjustment = downloaded[-1]["sum"] + offset - old_total
     replacement.extend(
         {"start": row["start"], "sum": round(row["sum"] + adjustment, 6)}
         for row in previous
-        if row["start"] > last_day
+        if row["start"] >= range_end
     )
     existing = {row["start"]: row["sum"] for row in previous}
+    final = collapse_to_midnight(
+        [*({"start": k, "sum": v} for k, v in existing.items()), *replacement]
+    )
     return [
         row
-        for row in sorted(replacement, key=lambda row: row["start"])
+        for row in final
         if row["start"] not in existing
         or not math.isclose(
             row["sum"], existing[row["start"]], abs_tol=0.0000005, rel_tol=0
         )
+    ]
+
+
+def collapse_to_midnight(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Give every row of a local day that day's closing sum.
+
+    Later entries for the same start win. A day's change then appears only
+    on its first row (local midnight in the daily layout) and every other
+    hour of that day shows zero; daily totals are unchanged.
+    """
+    by_start = {row["start"]: row["sum"] for row in rows}
+    ordered = sorted(by_start.items())
+    closing: dict[Any, float] = {}
+    for start, total in ordered:
+        closing[dt_util.as_local(start).date()] = total
+    return [
+        {"start": start, "sum": closing[dt_util.as_local(start).date()]}
+        for start, _ in ordered
     ]
 
 
