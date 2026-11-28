@@ -3,11 +3,9 @@
 Meter readings reach the API days after the energy was used, so an entity
 state changes on the day of the poll, not of the consumption. To give the
 Energy dashboard the right days, the cumulative readings are imported as
-external statistics. Kraken Italy only provides daily readings (interval
-frequencies are rejected with KT-CT-4710), so each reading interval is spread
-evenly across its hours: the Energy dashboard shows 24 hourly bars for a day
-instead of booking the whole day in the first hour. The hourly profile is an
-estimate; daily and longer totals are the measured ones.
+external statistics. Daily consumption is booked at local midnight of the
+day it belongs to. Longer intervals are estimated across their local days,
+in proportion to elapsed time; they are not actual daily measurements.
 
 Downloaded periods replace previously imported periods, including estimates.
 Older totals are preserved and subsequent sums are adjusted when necessary.
@@ -47,8 +45,6 @@ ELECTRICITY = "electricity_consumption"
 ELECTRICITY_COST = "electricity_cost"
 GAS = "gas_consumption"
 
-HOUR = timedelta(hours=1)
-
 _NAMES = {
     ELECTRICITY: "Octopus {account} electricity consumption",
     ELECTRICITY_COST: "Octopus {account} electricity cost",
@@ -79,37 +75,41 @@ def period_rows(
     """Turn cumulative readings into statistic rows after *cursor*.
 
     *points* are ``(read_at, register_value)`` pairs. Each consecutive pair
-    contributes its delta to the UTC hours it overlaps, in proportion to
-    elapsed time, with ``sum`` continuing from the cursor. A row's ``sum`` is
-    the total at the end of its hour, as Home Assistant expects. A register
-    that goes backwards contributes zero. A zero baseline before the first
-    hour lets the Energy dashboard count that hour's consumption.
+    contributes its delta to the local days it overlaps, with ``sum``
+    continuing from the cursor. Longer intervals have an estimated daily
+    allocation, weighted by elapsed time (including 23/25-hour DST days).
+    A register that goes backwards contributes zero. A zero baseline before
+    the first day lets the Energy dashboard count that day's consumption.
     """
     # The provider can return revised readings at an identical timestamp.
     # Keep the last one; subtracting both can count the same interval twice.
     ordered = sorted(dict(points).items())
-    hourly: dict[datetime, float] = {}
+    daily: dict[datetime, float] = {}
     for (prev_at, prev_value), (read_at, value) in itertools.pairwise(ordered):
         duration = (read_at - prev_at).total_seconds()
         consumption = max(0.0, value - prev_value) * multiplier
-        part_start = dt_util.as_utc(prev_at)
+        part_start = prev_at
         while part_start < read_at:
-            start = part_start.replace(minute=0, second=0, microsecond=0)
-            part_end = min(read_at, start + HOUR)
-            hourly[start] = hourly.get(start, 0.0) + (
+            day = dt_util.as_local(part_start).date()
+            start = dt_util.as_utc(dt_util.start_of_local_day(day))
+            next_day = dt_util.as_utc(
+                dt_util.start_of_local_day(day + timedelta(days=1))
+            )
+            part_end = min(read_at, next_day)
+            daily[start] = daily.get(start, 0.0) + (
                 consumption * (part_end - part_start).total_seconds() / duration
             )
             part_start = part_end
 
     rows: list[dict[str, Any]] = []
     running = cursor.sum
-    if hourly and cursor.start is None:
-        rows.append({"start": min(hourly) - HOUR, "sum": running})
-    for start, consumption in sorted(hourly.items()):
+    if daily and cursor.start is None:
+        rows.append({"start": min(daily) - timedelta(hours=1), "sum": running})
+    for start, consumption in sorted(daily.items()):
         if cursor.start is not None and start <= cursor.start:
             continue
         running += consumption
-        # Only sum is needed: an hourly allocation is not a register snapshot.
+        # Only sum is needed: a daily allocation is not a register snapshot.
         rows.append({"start": start, "sum": round(running, 6)})
     last_start = rows[-1]["start"] if rows else cursor.start
     return rows, Cursor(last_start, running)
@@ -144,11 +144,11 @@ def readings_to_points(
 def reconcile_rows(
     downloaded: list[dict[str, Any]], stored: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Replace downloaded hours and propagate corrections to later sums.
+    """Replace downloaded days and propagate corrections to later sums.
 
     The downloaded baseline is relative to zero. Anchor it to the last
-    recorder sum before the first downloaded hour, then recalculate every
-    downloaded hour. A changed total also shifts later stored sums, retaining
+    recorder sum before the first downloaded day, then recalculate every
+    downloaded day. A changed total also shifts later stored sums, retaining
     those days' consumption even if this response ends before they do.
     """
     if len(downloaded) < 2:
@@ -168,14 +168,13 @@ def reconcile_rows(
     # range. Flatten such intermediate rows rather than leaving a dip.
     new_starts = [row["start"] for row in replacement]
     new_values = [row["sum"] for row in replacement]
-    covered = set(new_starts)
     replacement.extend(
         {
             "start": row["start"],
             "sum": new_values[bisect_right(new_starts, row["start"]) - 1],
         }
         for row in previous
-        if first_day <= row["start"] <= last_day and row["start"] not in covered
+        if first_day <= row["start"] <= last_day and row["start"] not in new_starts
     )
     earlier = [row for row in previous if row["start"] <= last_day]
     old_total = earlier[-1]["sum"] if earlier else 0.0
@@ -214,7 +213,7 @@ class StatisticsImporter:
         unit_class: str | None,
         multiplier: float = 1.0,
     ) -> int:
-        """Overwrite changed downloaded hours; return how many rows were written."""
+        """Overwrite changed downloaded days; return how many rows were written."""
         stat_id = statistic_id(account_number, kind)
         fingerprint = (
             tuple(sorted(dict(points).items())),
@@ -228,8 +227,7 @@ class StatisticsImporter:
         if not downloaded:
             return 0
         # A sliding response starting/ending within a day cannot replace
-        # that whole day's total. Reconcile only the hours of fully covered
-        # local days.
+        # that whole day's total. Reconcile only fully covered local days.
         first_read = min(point[0] for point in points)
         first_local_day = dt_util.as_local(first_read).date()
         first_day = dt_util.as_utc(dt_util.start_of_local_day(first_local_day))
